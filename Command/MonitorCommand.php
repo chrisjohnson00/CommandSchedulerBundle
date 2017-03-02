@@ -2,6 +2,7 @@
 
 namespace JMose\CommandSchedulerBundle\Command;
 
+use JMose\CommandSchedulerBundle\Domain\MonitorMessage;
 use Symfony\Bundle\FrameworkBundle\Command\ContainerAwareCommand;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -27,6 +28,11 @@ class MonitorCommand extends ContainerAwareCommand
     private $dumpMode;
 
     /**
+     * @var string The name of the environment the command is running as
+     */
+    private $environment;
+
+    /**
      * @var integer|boolean Number of seconds after a command is considered as timeout
      */
     private $lockTimeout;
@@ -42,6 +48,11 @@ class MonitorCommand extends ContainerAwareCommand
     private $sendMailIfNoError;
 
     /**
+     * @var $mailer \Swift_Mailer
+     */
+    private $mailer;
+
+    /**
      * @inheritdoc
      */
     protected function configure()
@@ -50,6 +61,7 @@ class MonitorCommand extends ContainerAwareCommand
             ->setName('scheduler:monitor')
             ->setDescription('Monitor scheduled commands')
             ->addOption('dump', null, InputOption::VALUE_NONE, 'Display result instead of send mail')
+            ->addOption('test', null, InputOption::VALUE_NONE, 'Echo things for integration testing purposes')
             ->setHelp('This class is for monitoring all active commands.');
     }
 
@@ -63,12 +75,14 @@ class MonitorCommand extends ContainerAwareCommand
     {
         $this->lockTimeout = $this->getContainer()->getParameter('jmose_command_scheduler.lock_timeout');
         $this->dumpMode = $input->getOption('dump');
+        $this->environment = $this->getContainer()->get('kernel')->getEnvironment();
         $this->receiver = $this->getContainer()->getParameter('jmose_command_scheduler.monitor_mail');
         $this->sendMailIfNoError = $this->getContainer()->getParameter('jmose_command_scheduler.send_ok');
 
         $this->em = $this->getContainer()->get('doctrine')->getManager(
             $this->getContainer()->getParameter('jmose_command_scheduler.doctrine_manager')
         );
+        $this->mailer = $this->getContainer()->get('mailer');
     }
 
     /**
@@ -91,29 +105,27 @@ class MonitorCommand extends ContainerAwareCommand
 
         // Commands in error
         if (count($failedCommands) > 0) {
-            $message = "";
+            $messages = array();
 
             foreach ($failedCommands as $command) {
-                $message .= sprintf("%s: returncode %s, locked: %s, last execution: %s\n",
-                    $command->getName(),
-                    $command->getLastReturnCode(),
-                    $command->getLocked(),
-                    $command->getLastExecution()->format('Y-m-d H:i')
-                );
+                $message = new MonitorMessage($command->getName(), $command->getLastReturnCode(), $command->getLocked(), $command->getLastExecution());
+                array_push($messages, $message);
             }
 
             // if --dump option, don't send mail
             if ($this->dumpMode) {
-                $output->writeln($message);
+                foreach ($messages as $message){
+                    $output->writeln($message->__toString());
+                }
             } else {
-                $this->sendMails($message);
+                $this->sendErrorMails($messages);
             }
 
         } else {
             if ($this->dumpMode) {
                 $output->writeln('No errors found.');
             } elseif ($this->sendMailIfNoError) {
-                $this->sendMails('No errors found.');
+                $this->sendNoErrorMails();
             }
         }
     }
@@ -121,18 +133,44 @@ class MonitorCommand extends ContainerAwareCommand
     /**
      * Send message to email receivers
      *
-     * @param string $message message to be sent
+     * @param $messages MonitorMessage[] An array containing one or more MonitorMessage objects
      */
-    private function sendMails($message)
+    public function sendErrorMails($messages)
+    {
+        // override at app/Resources/JMoseCommandSchedulerBundle/views/Emails/error.html.twig
+        $body = $this->getContainer()->get('templating')->render('JMoseCommandSchedulerBundle:Emails:error.html.twig', array('messages' => $messages));
+        $this->sendMessage($body);
+    }
+
+    public function sendNoErrorMails()
+    {
+        // override at app/Resources/JMoseCommandSchedulerBundle/views/Emails/noerror.html.twig
+        $body = $this->getContainer()->get('templating')->render('JMoseCommandSchedulerBundle:Emails:noerror.html.twig');
+        $this->sendMessage($body);
+    }
+
+    private function sendMessage($body)
     {
         // prepare email constants
         $hostname = gethostname();
         $subject = "cronjob monitoring " . $hostname . ", " . date('Y-m-d H:i:s');
-        $headers = 'From: cron-monitor@' . $hostname . "\r\n" .
-            'X-Mailer: PHP/' . phpversion();
+        $message = \Swift_Message::newInstance()->setSubject($subject)->setFrom('cron-monitor@' . $hostname)->setTo($this->receiver)->setBody($body, 'text/html');
+        $this->getMailer()->send($message);
+    }
 
-        foreach ($this->receiver as $rcv) {
-            mail(trim($rcv), $subject, $message, $headers);
-        }
+    /**
+     * @return \Swift_Mailer
+     */
+    public function getMailer()
+    {
+        return $this->mailer;
+    }
+
+    /**
+     * @param \Swift_Mailer $mailer
+     */
+    public function setMailer($mailer)
+    {
+        $this->mailer = $mailer;
     }
 }
